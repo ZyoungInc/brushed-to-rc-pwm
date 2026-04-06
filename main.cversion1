@@ -1,0 +1,303 @@
+#include "REG52.H"
+
+/* =========================================================
+   STC8G1K08A-8PIN
+   35MHz / Timer0 1T / 4us tick
+   输出：125Hz RC 脉冲（8ms 一帧）
+   输入 PWM：约 314Hz，最大占空比约 60%
+
+   输入：
+       A -> P3.0 (pin 5)
+       B -> P3.1 (pin 6)
+       C -> P3.2 (pin 7)
+       D -> P3.3 (pin 8)
+
+   输出：
+       E -> P5.4 (pin 1)
+       F -> P5.5 (pin 3)
+
+   规则：
+       A=0,B=0 -> E=1500us
+       A有PWM   -> E=1500~2000us
+       B有PWM   -> E=1500~1000us
+
+       C=0,D=0 -> F=1500us
+       C有PWM   -> F=1500~2000us
+       D有PWM   -> F=1500~1000us
+
+   优化：
+       - 输入最大占空比按 60% 重新归一化
+       - 连续采样 2 帧取平均后，再更新输出
+   ========================================================= */
+
+/* =========================
+   参数区
+   ========================= */
+#define FOSC                       35000000UL   /* 35MHz */
+#define TICK_US                    4UL          /* 4us 中断节拍 */
+
+/* 输出改成 125Hz */
+#define FRAME_US                   8000UL       /* 8ms = 125Hz */
+
+/* 输出脉宽范围 */
+#define OUT_MIN_US                 1000UL
+#define OUT_MID_US                 1500UL
+#define OUT_MAX_US                 2000UL
+
+/* 输入最大占空比：最大约为 60% */
+#define INPUT_MAX_DUTY_PERMILLE    600UL
+
+/* 连续采样多少帧后取平均再更新输出 */
+#define AVG_FRAME_COUNT            2UL
+
+/* 上电先保持中位时间 */
+#define ARM_TIME_MS                2000UL
+
+/* =========================
+   派生参数
+   ========================= */
+#define FRAME_TICKS                (FRAME_US / TICK_US)   /* 8000/4 = 2000 */
+#define MID_TICKS                  (OUT_MID_US / TICK_US) /* 1500/4 = 375 */
+#define POS_SPAN_TICKS             ((OUT_MAX_US - OUT_MID_US) / TICK_US) /* 125 */
+#define NEG_SPAN_TICKS             ((OUT_MID_US - OUT_MIN_US) / TICK_US) /* 125 */
+#define ARM_FRAMES                 ((ARM_TIME_MS * 1000UL) / FRAME_US)
+
+/* 输入最大有效高电平采样数（对应 60% duty） */
+#define INPUT_MAX_ACTIVE_TICKS     ((FRAME_TICKS * INPUT_MAX_DUTY_PERMILLE) / 1000UL)
+
+/* Timer0 重装值：35MHz, 1T, 4us */
+#define TIMER0_RELOAD              (65536UL - (FOSC / 1000000UL * TICK_US))
+#define TIMER0_RH                  ((unsigned char)(TIMER0_RELOAD >> 8))
+#define TIMER0_RL                  ((unsigned char)(TIMER0_RELOAD & 0xFF))
+
+/* =========================
+   引脚定义
+   ========================= */
+sbit IN_A  = P3^0;   /* pin 5 */
+sbit IN_B  = P3^1;   /* pin 6 */
+sbit IN_C  = P3^2;   /* pin 7 */
+sbit IN_D  = P3^3;   /* pin 8 */
+
+sbit OUT_E = P5^4;   /* pin 1 */
+sbit OUT_F = P5^5;   /* pin 3 */
+
+/* =========================
+   全局变量
+   ========================= */
+volatile unsigned int  g_tick_in_frame = 0;
+
+volatile unsigned int  g_pulse_e_ticks = MID_TICKS;
+volatile unsigned int  g_pulse_f_ticks = MID_TICKS;
+
+volatile unsigned int  g_cnt_a = 0;
+volatile unsigned int  g_cnt_b = 0;
+volatile unsigned int  g_cnt_c = 0;
+volatile unsigned int  g_cnt_d = 0;
+
+/* 两帧平均用累加器 */
+volatile unsigned long g_sum_a = 0;
+volatile unsigned long g_sum_b = 0;
+volatile unsigned long g_sum_c = 0;
+volatile unsigned long g_sum_d = 0;
+volatile unsigned char g_avg_frame_counter = 0;
+
+volatile unsigned int  g_arm_frames = ARM_FRAMES;
+
+/* =========================
+   GPIO 初始化
+   ========================= */
+void gpio_init(void)
+{
+    /* P3.0~P3.3 = 高阻输入: M1=1, M0=0 */
+    P3M1 |=  0x0F;
+    P3M0 &= ~0x0F;
+
+    /* P5.4~P5.5 = 推挽输出: M1=0, M0=1 */
+    P5M1 &= ~0x30;
+    P5M0 |=  0x30;
+
+    OUT_E = 0;
+    OUT_F = 0;
+}
+
+/* =========================
+   把一个方向的输入采样数映射成输出偏移
+   按 60% 满量程重新归一化
+   ========================= */
+static unsigned int map_count_to_offset(unsigned int cnt, unsigned int span_ticks)
+{
+    unsigned int offset;
+
+    if (cnt == 0)
+    {
+        return 0;
+    }
+
+    if (cnt >= INPUT_MAX_ACTIVE_TICKS)
+    {
+        return span_ticks;
+    }
+
+    /* 四舍五入 */
+    offset = (unsigned int)(((unsigned long)cnt * span_ticks + (INPUT_MAX_ACTIVE_TICKS / 2)) / INPUT_MAX_ACTIVE_TICKS);
+
+    if (offset > span_ticks)
+    {
+        offset = span_ticks;
+    }
+
+    return offset;
+}
+
+/* =========================
+   根据一对输入采样数，换算输出脉宽
+   ========================= */
+static unsigned int calc_pulse_from_pair(unsigned int cnt_pos, unsigned int cnt_neg)
+{
+    unsigned int offset;
+
+    if ((cnt_pos == 0) && (cnt_neg == 0))
+    {
+        return MID_TICKS;
+    }
+
+    if ((cnt_pos != 0) && (cnt_neg != 0))
+    {
+        return MID_TICKS;
+    }
+
+    if (cnt_pos != 0)
+    {
+        offset = map_count_to_offset(cnt_pos, POS_SPAN_TICKS);
+        return MID_TICKS + offset;
+    }
+
+    offset = map_count_to_offset(cnt_neg, NEG_SPAN_TICKS);
+    return MID_TICKS - offset;
+}
+
+/* =========================
+   Timer0 初始化
+   4us 中断一次
+   ========================= */
+void timer0_init(void)
+{
+    AUXR |= 0x80;     /* Timer0 1T 模式 */
+
+    TMOD &= 0xF0;
+    TMOD |= 0x01;     /* 16位定时器 */
+
+    TH0 = TIMER0_RH;
+    TL0 = TIMER0_RL;
+
+    ET0 = 1;
+    EA  = 1;
+    TR0 = 1;
+}
+
+/* =========================
+   Timer0 中断
+   1) 采样 A/B/C/D 占空比
+   2) 输出 E/F RC 脉冲
+   3) 每 2 帧求平均，再更新输出
+   ========================= */
+void timer0_isr(void) interrupt 1 using 1
+{
+    unsigned int avg_a, avg_b, avg_c, avg_d;
+
+    TH0 = TIMER0_RH;
+    TL0 = TIMER0_RL;
+
+    /* 采样输入高电平时间 */
+    if (IN_A) g_cnt_a++;
+    if (IN_B) g_cnt_b++;
+    if (IN_C) g_cnt_c++;
+    if (IN_D) g_cnt_d++;
+
+    /* 每帧开始拉高输出 */
+    if (g_tick_in_frame == 0)
+    {
+        OUT_E = 1;
+        OUT_F = 1;
+    }
+
+    /* 到达目标脉宽后拉低 */
+    if (g_tick_in_frame == g_pulse_e_ticks)
+    {
+        OUT_E = 0;
+    }
+
+    if (g_tick_in_frame == g_pulse_f_ticks)
+    {
+        OUT_F = 0;
+    }
+
+    g_tick_in_frame++;
+
+    /* 一帧结束 */
+    if (g_tick_in_frame >= FRAME_TICKS)
+    {
+        g_tick_in_frame = 0;
+
+        if (g_arm_frames > 0)
+        {
+            g_arm_frames--;
+            g_pulse_e_ticks = MID_TICKS;
+            g_pulse_f_ticks = MID_TICKS;
+
+            /* 上电保持中位时，也把平均累加器清掉 */
+            g_sum_a = 0;
+            g_sum_b = 0;
+            g_sum_c = 0;
+            g_sum_d = 0;
+            g_avg_frame_counter = 0;
+        }
+        else
+        {
+            /* 累加本帧输入 */
+            g_sum_a += g_cnt_a;
+            g_sum_b += g_cnt_b;
+            g_sum_c += g_cnt_c;
+            g_sum_d += g_cnt_d;
+            g_avg_frame_counter++;
+
+            /* 满 2 帧后取平均，更新输出 */
+            if (g_avg_frame_counter >= AVG_FRAME_COUNT)
+            {
+                avg_a = (unsigned int)(g_sum_a / AVG_FRAME_COUNT);
+                avg_b = (unsigned int)(g_sum_b / AVG_FRAME_COUNT);
+                avg_c = (unsigned int)(g_sum_c / AVG_FRAME_COUNT);
+                avg_d = (unsigned int)(g_sum_d / AVG_FRAME_COUNT);
+
+                g_pulse_e_ticks = calc_pulse_from_pair(avg_a, avg_b);
+                g_pulse_f_ticks = calc_pulse_from_pair(avg_c, avg_d);
+
+                g_sum_a = 0;
+                g_sum_b = 0;
+                g_sum_c = 0;
+                g_sum_d = 0;
+                g_avg_frame_counter = 0;
+            }
+        }
+
+        /* 清本帧计数 */
+        g_cnt_a = 0;
+        g_cnt_b = 0;
+        g_cnt_c = 0;
+        g_cnt_d = 0;
+    }
+}
+
+/* =========================
+   主函数
+   ========================= */
+void main(void)
+{
+    gpio_init();
+    timer0_init();
+
+    while (1)
+    {
+        /* 所有工作都在中断中完成 */
+    }
+}
