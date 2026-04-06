@@ -145,8 +145,8 @@ You can modify:
 
 ## 🚀 Future Ideas
 
-- Input capture (higher precision PWM decoding)
-- Configurable via UART
+- ADC capture (higher capability just in case PWM decoding doesn't working)
+- Configurable via UART to avoid re-download the full program each time
 - EEPROM profile storage
 - Auto calibration
 
